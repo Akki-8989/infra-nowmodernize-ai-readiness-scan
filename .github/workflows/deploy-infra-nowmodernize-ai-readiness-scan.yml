@@ -1,0 +1,436 @@
+name: Deploy infra-nowmodernize-ai-readiness-scan
+
+on:
+  workflow_call:
+    inputs:
+      repo_name:
+        required: true
+        type: string
+        description: 'Target repository name to deploy'
+      infra_repo:
+        required: true
+        type: string
+        description: 'Infrastructure repository name'
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  NODE_VERSION: '20.x'
+
+jobs:
+  detect-and-setup:
+    runs-on: ubuntu-latest
+    outputs:
+      project_type: ${{ steps.detect.outputs.project_type }}
+      project_path: ${{ steps.detect.outputs.project_path }}
+      build_command: ${{ steps.detect.outputs.build_command }}
+      output_path: ${{ steps.detect.outputs.output_path }}
+
+    steps:
+    - name: Checkout Application Repository
+      uses: actions/checkout@v4
+
+    - name: Detect Project Type
+      id: detect
+      run: |
+        PROJECT_TYPE="backend"
+        
+        if [ -f "package.json" ]; then
+          if grep -q '"react"\|"vue"\|"@angular/core"\|"next"\|"vite"' package.json 2>/dev/null; then
+            PROJECT_TYPE="frontend"
+          fi
+        fi
+        
+        if [ -f "*.csproj" ] || find . -name "*.csproj" -type f | head -1 | grep -q "."; then
+          if [ "$PROJECT_TYPE" != "frontend" ]; then
+            PROJECT_TYPE="backend"
+          fi
+        fi
+        
+        echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
+        
+        if [ "$PROJECT_TYPE" = "frontend" ]; then
+          if [ -f "package.json" ]; then
+            if grep -q '"next"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=out" >> $GITHUB_OUTPUT
+            elif grep -q '"vite"\|"@vitejs"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+            elif grep -q '"react-scripts"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=build" >> $GITHUB_OUTPUT
+            elif grep -q '"@angular/core"' package.json; then
+              echo "build_command=npm run build -- --configuration production" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+            elif grep -q '"vue"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+            else
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+            fi
+          fi
+          echo "project_path=." >> $GITHUB_OUTPUT
+        else
+          CSPROJ_PATH=$(find . -name "*.csproj" -type f | head -1)
+          if [ -n "$CSPROJ_PATH" ]; then
+            echo "project_path=$CSPROJ_PATH" >> $GITHUB_OUTPUT
+          else
+            echo "project_path=." >> $GITHUB_OUTPUT
+          fi
+          echo "build_command=dotnet build" >> $GITHUB_OUTPUT
+          echo "output_path=publish" >> $GITHUB_OUTPUT
+        fi
+        
+        echo "Detected project type: $PROJECT_TYPE"
+
+  terraform:
+    runs-on: ubuntu-latest
+    needs: detect-and-setup
+    outputs:
+      webapp_name: ${{ steps.terraform_output.outputs.webapp_name }}
+      resource_group: ${{ steps.terraform_output.outputs.resource_group }}
+      static_webapp_name: ${{ steps.terraform_output.outputs.static_webapp_name }}
+      deployment_token: ${{ steps.terraform_output.outputs.deployment_token }}
+
+    steps:
+    - name: Checkout Infrastructure Repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository_owner }}/${{ inputs.infra_repo }}
+        path: infra
+
+    - name: Debug - List contents
+      run: |
+        echo "=== Infrastructure Repo ==="
+        echo "${{ github.repository_owner }}/${{ inputs.infra_repo }}"
+        echo ""
+        echo "=== List infra/terraform folder ==="
+        ls -la ./infra/terraform/
+        echo ""
+        echo "=== List component folder ==="
+        ls -la ./infra/terraform/infra-nowmodernize-ai-readiness-scan
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: |
+          {
+            "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+            "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+            "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+            "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+          }
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_wrapper: false
+
+    - name: Terraform Init
+      working-directory: ./infra/terraform/infra-nowmodernize-ai-readiness-scan
+      run: terraform init
+
+    - name: Import Existing Resources
+      working-directory: ./infra/terraform/infra-nowmodernize-ai-readiness-scan
+      env:
+        SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+      run: |
+        APP_NAME="infra-nowmodernize-ai-readiness-scan"
+        RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
+        SUBSCRIPTION_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+        PROJECT_TYPE="${{ needs.detect-and-setup.outputs.project_type }}"
+        RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+        HAS_SQL_PASSWORD="false"
+        
+        if [ -n "$SQL_ADMIN_PASSWORD" ]; then
+          HAS_SQL_PASSWORD="true"
+        fi
+        
+        echo "=========================================="
+        echo "App Name: $APP_NAME"
+        echo "Project Type: $PROJECT_TYPE"
+        echo "Resource Prefix: $RESOURCE_PREFIX"
+        echo "Has SQL Password: $HAS_SQL_PASSWORD"
+        echo "=========================================="
+        
+        resource_exists_in_azure() {
+          local CHECK_COMMAND=$1
+          if eval "$CHECK_COMMAND" > /dev/null 2>&1; then
+            return 0
+          else
+            return 1
+          fi
+        }
+        
+        resource_in_state() {
+          local RESOURCE_ADDRESS=$1
+          if terraform state list 2>/dev/null | grep -q "$RESOURCE_ADDRESS"; then
+            return 0
+          else
+            return 1
+          fi
+        }
+        
+        import_resource() {
+          local RESOURCE_TYPE=$1
+          local RESOURCE_ADDRESS=$2
+          local RESOURCE_ID=$3
+          
+          echo ""
+          echo "--- Importing $RESOURCE_TYPE ---"
+          
+          if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+            terraform import \
+              -var="app_name=$APP_NAME" \
+              -var="project_type=$PROJECT_TYPE" \
+              -var="sql_admin_password=$SQL_ADMIN_PASSWORD" \
+              "$RESOURCE_ADDRESS" "$RESOURCE_ID" 2>&1 && echo "$RESOURCE_TYPE: Import SUCCESS" || echo "$RESOURCE_TYPE: Import FAILED"
+          else
+            terraform import \
+              -var="app_name=$APP_NAME" \
+              -var="project_type=$PROJECT_TYPE" \
+              "$RESOURCE_ADDRESS" "$RESOURCE_ID" 2>&1 && echo "$RESOURCE_TYPE: Import SUCCESS" || echo "$RESOURCE_TYPE: Import FAILED"
+          fi
+        }
+        
+        # 1. Resource Group
+        echo ""
+        echo "=== Checking Resource Group ==="
+        if resource_in_state "azurerm_resource_group.main"; then
+          echo "Resource Group: Already in state - SKIP"
+        elif resource_exists_in_azure "az group exists --name $RG_NAME | grep -q true"; then
+          echo "Resource Group: EXISTS in Azure"
+          import_resource "Resource Group" "azurerm_resource_group.main" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME"
+        else
+          echo "Resource Group: Does NOT exist - will be created"
+        fi
+        
+        # Backend Resources
+        if [ "$PROJECT_TYPE" = "backend" ]; then
+          
+          echo ""
+          echo "=== Checking App Service Plan ==="
+          if resource_in_state "azurerm_service_plan.main\[0\]"; then
+            echo "App Service Plan: Already in state - SKIP"
+          elif resource_exists_in_azure "az appservice plan show --name ${RESOURCE_PREFIX}-plan --resource-group $RG_NAME"; then
+            echo "App Service Plan: EXISTS in Azure"
+            import_resource "App Service Plan" "azurerm_service_plan.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/serverFarms/${RESOURCE_PREFIX}-plan"
+          else
+            echo "App Service Plan: Does NOT exist - will be created"
+          fi
+          
+          echo ""
+          echo "=== Checking Web App ==="
+          if resource_in_state "azurerm_windows_web_app.main\[0\]"; then
+            echo "Web App: Already in state - SKIP"
+          elif resource_exists_in_azure "az webapp show --name ${RESOURCE_PREFIX}-webapp --resource-group $RG_NAME"; then
+            echo "Web App: EXISTS in Azure"
+            import_resource "Web App" "azurerm_windows_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-webapp"
+          else
+            echo "Web App: Does NOT exist - will be created"
+          fi
+          
+          echo ""
+          echo "=== Checking SQL Server ==="
+          if resource_in_state "azurerm_mssql_server.main\[0\]"; then
+            echo "SQL Server: Already in state - SKIP"
+          elif resource_exists_in_azure "az sql server show --name ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+            echo "SQL Server: EXISTS in Azure"
+            if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+              import_resource "SQL Server" "azurerm_mssql_server.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver"
+            fi
+          else
+            echo "SQL Server: Does NOT exist"
+          fi
+          
+          echo ""
+          echo "=== Checking SQL Database ==="
+          if resource_in_state "azurerm_mssql_database.main\[0\]"; then
+            echo "SQL Database: Already in state - SKIP"
+          elif resource_exists_in_azure "az sql db show --name ${RESOURCE_PREFIX}-db --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+            echo "SQL Database: EXISTS in Azure"
+            if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+              import_resource "SQL Database" "azurerm_mssql_database.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/databases/${RESOURCE_PREFIX}-db"
+            fi
+          else
+            echo "SQL Database: Does NOT exist"
+          fi
+          
+          echo ""
+          echo "=== Checking SQL Firewall Rule ==="
+          if resource_in_state "azurerm_mssql_firewall_rule.allow_azure\[0\]"; then
+            echo "SQL Firewall Rule: Already in state - SKIP"
+          elif resource_exists_in_azure "az sql server firewall-rule show --name AllowAzureServices --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+            echo "SQL Firewall Rule: EXISTS in Azure"
+            if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+              import_resource "SQL Firewall Rule" "azurerm_mssql_firewall_rule.allow_azure[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/firewallRules/AllowAzureServices"
+            fi
+          else
+            echo "SQL Firewall Rule: Does NOT exist"
+          fi
+        fi
+        
+        # Frontend Resources
+        if [ "$PROJECT_TYPE" = "frontend" ]; then
+          echo ""
+          echo "=== Checking Static Web App ==="
+          if resource_in_state "azurerm_static_web_app.main\[0\]"; then
+            echo "Static Web App: Already in state - SKIP"
+          elif resource_exists_in_azure "az staticwebapp show --name ${RESOURCE_PREFIX}-static --resource-group $RG_NAME"; then
+            echo "Static Web App: EXISTS in Azure"
+            import_resource "Static Web App" "azurerm_static_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/staticSites/${RESOURCE_PREFIX}-static"
+          else
+            echo "Static Web App: Does NOT exist - will be created"
+          fi
+        fi
+        
+        echo ""
+        echo "=========================================="
+        echo "Import process completed"
+        echo "=========================================="
+
+    - name: Terraform Plan
+      working-directory: ./infra/terraform/infra-nowmodernize-ai-readiness-scan
+      run: |
+        PROJECT_TYPE="${{ needs.detect-and-setup.outputs.project_type }}"
+        
+        if [ -n "${{ secrets.SQL_ADMIN_PASSWORD }}" ] && [ "$PROJECT_TYPE" = "backend" ]; then
+          terraform plan \
+            -var="app_name=infra-nowmodernize-ai-readiness-scan" \
+            -var="project_type=$PROJECT_TYPE" \
+            -var="sql_admin_password=${{ secrets.SQL_ADMIN_PASSWORD }}" \
+            -out=tfplan
+        else
+          terraform plan \
+            -var="app_name=infra-nowmodernize-ai-readiness-scan" \
+            -var="project_type=$PROJECT_TYPE" \
+            -out=tfplan
+        fi
+
+    - name: Terraform Apply
+      working-directory: ./infra/terraform/infra-nowmodernize-ai-readiness-scan
+      run: terraform apply -auto-approve tfplan
+
+    - name: Get Terraform Outputs
+      id: terraform_output
+      working-directory: ./infra/terraform/infra-nowmodernize-ai-readiness-scan
+      run: |
+        echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
+        
+        PROJECT_TYPE="${{ needs.detect-and-setup.outputs.project_type }}"
+        
+        if [ "$PROJECT_TYPE" = "backend" ]; then
+          echo "webapp_name=$(terraform output -raw webapp_name)" >> $GITHUB_OUTPUT
+        else
+          echo "static_webapp_name=$(terraform output -raw static_webapp_name)" >> $GITHUB_OUTPUT
+          echo "deployment_token=$(terraform output -raw static_webapp_api_key)" >> $GITHUB_OUTPUT
+        fi
+
+  build-backend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+    if: needs.detect-and-setup.outputs.project_type == 'backend'
+
+    steps:
+    - name: Checkout Application Repository
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore dependencies
+      run: dotnet restore ${{ needs.detect-and-setup.outputs.project_path }}
+
+    - name: Build
+      run: dotnet build ${{ needs.detect-and-setup.outputs.project_path }} --configuration Release --no-restore
+
+    - name: Publish
+      run: dotnet publish ${{ needs.detect-and-setup.outputs.project_path }} --configuration Release --output ./publish --no-build
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: webapp-artifact
+        path: ./publish
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+    if: needs.detect-and-setup.outputs.project_type == 'frontend'
+
+    steps:
+    - name: Checkout Application Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build
+      run: ${{ needs.detect-and-setup.outputs.build_command }}
+      env:
+        CI: false
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: frontend-artifact
+        path: ${{ needs.detect-and-setup.outputs.output_path }}
+
+  deploy-backend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-backend]
+    if: needs.detect-and-setup.outputs.project_type == 'backend'
+
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: webapp-artifact
+        path: ./publish
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: |
+          {
+            "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+            "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+            "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+            "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+          }
+
+    - name: Deploy to Azure Web App
+      uses: azure/webapps-deploy@v3
+      with:
+        app-name: ${{ needs.terraform.outputs.webapp_name }}
+        package: ./publish
+
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-frontend]
+    if: needs.detect-and-setup.outputs.project_type == 'frontend'
+
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: frontend-artifact
+        path: ./dist
+
+    - name: Deploy to Azure Static Web App
+      uses: Azure/static-web-apps-deploy@v1
+      with:
+        azure_static_web_apps_api_token: ${{ needs.terraform.outputs.deployment_token }}
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        action: "upload"
+        app_location: "./dist"
+        skip_app_build: true
