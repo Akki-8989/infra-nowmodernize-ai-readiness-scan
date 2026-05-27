@@ -1,0 +1,11 @@
+{
+  "FrontendLinks": [
+    {
+      "Frontend": "ui-nowmodernize-ai-readiness-scan",
+      "Backends": [
+        "be-backend"
+      ]
+    }
+  ],
+  "BackendLinks": []
+}
