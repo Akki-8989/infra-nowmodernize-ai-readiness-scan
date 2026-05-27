@@ -68,6 +68,12 @@ variable "database_name" {
   default     = ""
 }
 
+variable "tier" {
+  type        = string
+  description = "Deployment tier: free, standard, premium"
+  default     = "free"
+}
+
 # ============================================
 # LOCALS
 # ============================================
@@ -78,6 +84,10 @@ locals {
     ".",
     "-"
   )
+
+  # Tier-based SKU
+  sku_name  = var.tier == "premium" ? "S1" : var.tier == "standard" ? "B1" : "F1"
+  always_on = var.tier != "free"
 
   # Runtime conditions
   is_dotnet  = var.runtime_stack == "dotnet"
@@ -121,7 +131,7 @@ resource "azurerm_service_plan" "main" {
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   os_type             = local.is_dotnet ? "Windows" : "Linux"
-  sku_name            = "F1"
+  sku_name            = local.sku_name
 
   depends_on = [azurerm_resource_group.main]
 }
@@ -138,7 +148,7 @@ resource "azurerm_windows_web_app" "main" {
   service_plan_id     = azurerm_service_plan.main[0].id
 
   site_config {
-    always_on = false
+    always_on = local.always_on
     application_stack {
       dotnet_version = "v8.0"
     }
@@ -176,7 +186,7 @@ resource "azurerm_linux_web_app" "main" {
   service_plan_id     = azurerm_service_plan.main[0].id
 
   site_config {
-    always_on = false
+    always_on = local.always_on
     application_stack {
       node_version   = var.runtime_stack == "node" ? "20-lts" : null
       python_version = var.runtime_stack == "python" ? "3.11" : null
