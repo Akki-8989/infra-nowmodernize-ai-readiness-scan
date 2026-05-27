@@ -22,7 +22,7 @@ variable "app_name" {
 
 variable "location" {
   type    = string
-  default = "East US"
+  default = "South India"
 }
 
 variable "project_type" {
