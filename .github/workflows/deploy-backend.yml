@@ -1,0 +1,669 @@
+name: Reusable Deploy Workflow - Backend (Generic)
+
+on:
+  workflow_call:
+    inputs:
+      repo_name:
+        required: true
+        type: string
+        description: 'Target repository name to deploy'
+      infra_repo:
+        required: true
+        type: string
+        description: 'Infrastructure repository name'
+      backend_api_url:
+        required: false
+        type: string
+        description: 'Backend API URL for frontend to connect to (single backend)'
+      backend_urls:
+        required: false
+        type: string
+        description: 'Comma-separated backend URLs (multiple backends - triggers gateway)'
+      database_type:
+        required: false
+        type: string
+        default: 'none'
+        description: 'Database type: none, sqlserver, postgresql, mysql'
+      database_name:
+        required: false
+        type: string
+        default: ''
+        description: 'Database name (optional - auto-generated if empty)'
+      backend_dependency_urls:
+        required: false
+        type: string
+        default: ''
+        description: 'Comma-separated KEY=VALUE pairs for backend dependency URLs (e.g., BE_PLATFORM_URL=https://be-platform-webapp.azurewebsites.net)'
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  NODE_VERSION: '20.x'
+  PYTHON_VERSION: '3.11'
+  JAVA_VERSION: '17'
+
+jobs:
+  # ============================================
+  # JOB 1: Detect Technology & Setup
+  # ============================================
+  detect-and-setup:
+    runs-on: ubuntu-latest
+    outputs:
+      runtime_stack: ${{ steps.detect.outputs.runtime_stack }}
+      project_path: ${{ steps.detect.outputs.project_path }}
+      app_name: ${{ steps.setup.outputs.app_name }}
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      - name: Detect Technology
+        id: detect
+        run: |
+          RUNTIME_STACK="dotnet"
+
+          # Priority: .csproj -> requirements.txt/pyproject.toml -> pom.xml/build.gradle -> package.json
+          if find . -name "*.csproj" -type f | head -1 | grep -q "."; then
+            RUNTIME_STACK="dotnet"
+            CSPROJ_PATH=$(find . -name "*.csproj" -not -path "*/test*" -not -path "*/Test*" -type f | head -1)
+            if [ -z "$CSPROJ_PATH" ]; then
+              CSPROJ_PATH=$(find . -name "*.csproj" -type f | head -1)
+            fi
+            echo "project_path=$CSPROJ_PATH" >> $GITHUB_OUTPUT
+          elif [ -f "requirements.txt" ] || [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+            RUNTIME_STACK="python"
+            echo "project_path=." >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then
+            RUNTIME_STACK="java"
+            echo "project_path=." >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ]; then
+            RUNTIME_STACK="node"
+            echo "project_path=." >> $GITHUB_OUTPUT
+          else
+            echo "project_path=." >> $GITHUB_OUTPUT
+          fi
+
+          echo "runtime_stack=$RUNTIME_STACK" >> $GITHUB_OUTPUT
+          echo "Detected runtime stack: $RUNTIME_STACK"
+
+      - name: Setup App Name
+        id: setup
+        run: |
+          APP_NAME=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "App name: $APP_NAME"
+
+  # ============================================
+  # JOB 2: Terraform (Infrastructure)
+  # ============================================
+  terraform:
+    runs-on: ubuntu-latest
+    needs: detect-and-setup
+    outputs:
+      webapp_name: ${{ steps.terraform_output.outputs.webapp_name }}
+      resource_group: ${{ steps.terraform_output.outputs.resource_group }}
+      db_server_fqdn: ${{ steps.terraform_output.outputs.db_server_fqdn }}
+      db_name: ${{ steps.terraform_output.outputs.db_name }}
+
+    steps:
+      - name: Checkout Infrastructure Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.infra_repo }}
+          path: infra
+
+      - name: Debug - List contents
+        run: |
+          echo "=== Infrastructure Repo ==="
+          echo "${{ github.repository_owner }}/${{ inputs.infra_repo }}"
+          echo ""
+          echo "=== List infra/terraform folder ==="
+          ls -la ./infra/terraform/
+          echo ""
+          echo "=== List backend folder ==="
+          ls -la ./infra/terraform/backend/
+          echo ""
+          echo "=== Runtime Stack: ${{ needs.detect-and-setup.outputs.runtime_stack }} ==="
+          echo "=== Database Type: ${{ inputs.database_type }} ==="
+          echo "=== Database Name: ${{ inputs.database_name }} ==="
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./infra/terraform/backend
+        run: terraform init
+
+      - name: Import Existing Resources
+        working-directory: ./infra/terraform/backend
+        env:
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          RUNTIME_STACK="${{ needs.detect-and-setup.outputs.runtime_stack }}"
+          DATABASE_TYPE="${{ inputs.database_type }}"
+          DATABASE_NAME="${{ inputs.database_name }}"
+          RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
+          SUBSCRIPTION_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+          RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          HAS_SQL_PASSWORD="false"
+
+          if [ -n "$SQL_ADMIN_PASSWORD" ]; then
+            HAS_SQL_PASSWORD="true"
+          fi
+
+          echo "=========================================="
+          echo "App Name: $APP_NAME"
+          echo "Runtime Stack: $RUNTIME_STACK"
+          echo "Database Type: $DATABASE_TYPE"
+          echo "Database Name: $DATABASE_NAME"
+          echo "Resource Prefix: $RESOURCE_PREFIX"
+          echo "Has SQL Password: $HAS_SQL_PASSWORD"
+          echo "=========================================="
+
+          # Build terraform import vars (dynamic - no hardcoded values)
+          build_import_vars() {
+            local VARS="-var=app_name=$APP_NAME -var=project_type=backend -var=runtime_stack=$RUNTIME_STACK"
+            if [ "$DATABASE_TYPE" != "none" ] && [ -n "$DATABASE_TYPE" ]; then
+              VARS="$VARS -var=database_type=$DATABASE_TYPE"
+            fi
+            if [ -n "$DATABASE_NAME" ]; then
+              VARS="$VARS -var=database_name=$DATABASE_NAME"
+            fi
+            if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+              VARS="$VARS -var=sql_admin_password=$SQL_ADMIN_PASSWORD"
+            fi
+            echo "$VARS"
+          }
+
+          resource_exists_in_azure() {
+            local CHECK_COMMAND=$1
+            if eval "$CHECK_COMMAND" > /dev/null 2>&1; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          resource_in_state() {
+            local RESOURCE_ADDRESS=$1
+            if terraform state list 2>/dev/null | grep -q "$RESOURCE_ADDRESS"; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          import_resource() {
+            local RESOURCE_TYPE=$1
+            local RESOURCE_ADDRESS=$2
+            local RESOURCE_ID=$3
+            local IMPORT_VARS=$(build_import_vars)
+
+            echo ""
+            echo "--- Importing $RESOURCE_TYPE ---"
+            terraform import $IMPORT_VARS "$RESOURCE_ADDRESS" "$RESOURCE_ID" 2>&1 && echo "$RESOURCE_TYPE: Import SUCCESS" || echo "$RESOURCE_TYPE: Import FAILED"
+          }
+
+          # ---- 1. Resource Group ----
+          echo ""
+          echo "=== Checking Resource Group ==="
+          if resource_in_state "azurerm_resource_group.main"; then
+            echo "Resource Group: Already in state - SKIP"
+          elif resource_exists_in_azure "az group exists --name $RG_NAME | grep -q true"; then
+            echo "Resource Group: EXISTS in Azure"
+            import_resource "Resource Group" "azurerm_resource_group.main" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME"
+          else
+            echo "Resource Group: Does NOT exist - will be created"
+          fi
+
+          # ---- 2. App Service Plan ----
+          echo ""
+          echo "=== Checking App Service Plan ==="
+          if resource_in_state "azurerm_service_plan.main\[0\]"; then
+            echo "App Service Plan: Already in state - SKIP"
+          elif resource_exists_in_azure "az appservice plan show --name ${RESOURCE_PREFIX}-plan --resource-group $RG_NAME"; then
+            echo "App Service Plan: EXISTS in Azure"
+            import_resource "App Service Plan" "azurerm_service_plan.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/serverFarms/${RESOURCE_PREFIX}-plan"
+          else
+            echo "App Service Plan: Does NOT exist - will be created"
+          fi
+
+          # ---- 3. Web App (Windows for .NET, Linux for others) ----
+          echo ""
+          echo "=== Checking Web App (Runtime: $RUNTIME_STACK) ==="
+          if [ "$RUNTIME_STACK" = "dotnet" ]; then
+            # Windows Web App for .NET
+            if resource_in_state "azurerm_windows_web_app.main\[0\]"; then
+              echo "Windows Web App: Already in state - SKIP"
+            elif resource_exists_in_azure "az webapp show --name ${RESOURCE_PREFIX}-webapp --resource-group $RG_NAME"; then
+              echo "Windows Web App: EXISTS in Azure"
+              import_resource "Windows Web App" "azurerm_windows_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-webapp"
+            else
+              echo "Windows Web App: Does NOT exist - will be created"
+            fi
+          else
+            # Linux Web App for Node.js, Python, Java
+            if resource_in_state "azurerm_linux_web_app.main\[0\]"; then
+              echo "Linux Web App: Already in state - SKIP"
+            elif resource_exists_in_azure "az webapp show --name ${RESOURCE_PREFIX}-webapp --resource-group $RG_NAME"; then
+              echo "Linux Web App: EXISTS in Azure"
+              import_resource "Linux Web App" "azurerm_linux_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-webapp"
+            else
+              echo "Linux Web App: Does NOT exist - will be created"
+            fi
+          fi
+
+          # ---- 4. SQL Server Resources (conditional) ----
+          if [ "$DATABASE_TYPE" = "sqlserver" ] && [ "$HAS_SQL_PASSWORD" = "true" ]; then
+            echo ""
+            echo "=== Checking SQL Server ==="
+            if resource_in_state "azurerm_mssql_server.main\[0\]"; then
+              echo "SQL Server: Already in state - SKIP"
+            elif resource_exists_in_azure "az sql server show --name ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+              echo "SQL Server: EXISTS in Azure"
+              import_resource "SQL Server" "azurerm_mssql_server.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver"
+            else
+              echo "SQL Server: Does NOT exist"
+            fi
+
+            EFFECTIVE_DB_NAME="${DATABASE_NAME:-${RESOURCE_PREFIX}-db}"
+            echo ""
+            echo "=== Checking SQL Database ==="
+            if resource_in_state "azurerm_mssql_database.main\[0\]"; then
+              echo "SQL Database: Already in state - SKIP"
+            elif resource_exists_in_azure "az sql db show --name $EFFECTIVE_DB_NAME --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+              echo "SQL Database: EXISTS in Azure"
+              import_resource "SQL Database" "azurerm_mssql_database.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/databases/$EFFECTIVE_DB_NAME"
+            else
+              echo "SQL Database: Does NOT exist"
+            fi
+
+            echo ""
+            echo "=== Checking SQL Firewall Rule ==="
+            if resource_in_state "azurerm_mssql_firewall_rule.allow_azure\[0\]"; then
+              echo "SQL Firewall Rule: Already in state - SKIP"
+            elif resource_exists_in_azure "az sql server firewall-rule show --name AllowAzureServices --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+              echo "SQL Firewall Rule: EXISTS in Azure"
+              import_resource "SQL Firewall Rule" "azurerm_mssql_firewall_rule.allow_azure[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/firewallRules/AllowAzureServices"
+            else
+              echo "SQL Firewall Rule: Does NOT exist"
+            fi
+          fi
+
+          # ---- 5. PostgreSQL Resources (conditional) ----
+          if [ "$DATABASE_TYPE" = "postgresql" ] && [ "$HAS_SQL_PASSWORD" = "true" ]; then
+            echo ""
+            echo "=== Checking PostgreSQL Server ==="
+            if resource_in_state "azurerm_postgresql_flexible_server.main\[0\]"; then
+              echo "PostgreSQL Server: Already in state - SKIP"
+            elif resource_exists_in_azure "az postgres flexible-server show --name ${RESOURCE_PREFIX}-pgserver --resource-group $RG_NAME"; then
+              echo "PostgreSQL Server: EXISTS in Azure"
+              import_resource "PostgreSQL Server" "azurerm_postgresql_flexible_server.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforPostgreSQL/flexibleServers/${RESOURCE_PREFIX}-pgserver"
+            else
+              echo "PostgreSQL Server: Does NOT exist"
+            fi
+
+            EFFECTIVE_DB_NAME="${DATABASE_NAME:-${RESOURCE_PREFIX}-db}"
+            echo ""
+            echo "=== Checking PostgreSQL Database ==="
+            if resource_in_state "azurerm_postgresql_flexible_server_database.main\[0\]"; then
+              echo "PostgreSQL Database: Already in state - SKIP"
+            elif resource_exists_in_azure "az postgres flexible-server db show --database-name $EFFECTIVE_DB_NAME --server-name ${RESOURCE_PREFIX}-pgserver --resource-group $RG_NAME"; then
+              echo "PostgreSQL Database: EXISTS in Azure"
+              import_resource "PostgreSQL Database" "azurerm_postgresql_flexible_server_database.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforPostgreSQL/flexibleServers/${RESOURCE_PREFIX}-pgserver/databases/$EFFECTIVE_DB_NAME"
+            else
+              echo "PostgreSQL Database: Does NOT exist"
+            fi
+
+            echo ""
+            echo "=== Checking PostgreSQL Firewall Rule ==="
+            if resource_in_state "azurerm_postgresql_flexible_server_firewall_rule.allow_azure\[0\]"; then
+              echo "PostgreSQL Firewall Rule: Already in state - SKIP"
+            elif resource_exists_in_azure "az postgres flexible-server firewall-rule show --name AllowAzureServices --resource-group $RG_NAME --server-name ${RESOURCE_PREFIX}-pgserver"; then
+              echo "PostgreSQL Firewall Rule: EXISTS in Azure"
+              import_resource "PostgreSQL Firewall Rule" "azurerm_postgresql_flexible_server_firewall_rule.allow_azure[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforPostgreSQL/flexibleServers/${RESOURCE_PREFIX}-pgserver/firewallRules/AllowAzureServices"
+            else
+              echo "PostgreSQL Firewall Rule: Does NOT exist"
+            fi
+          fi
+
+          # ---- 6. MySQL Resources (conditional) ----
+          if [ "$DATABASE_TYPE" = "mysql" ] && [ "$HAS_SQL_PASSWORD" = "true" ]; then
+            echo ""
+            echo "=== Checking MySQL Server ==="
+            if resource_in_state "azurerm_mysql_flexible_server.main\[0\]"; then
+              echo "MySQL Server: Already in state - SKIP"
+            elif resource_exists_in_azure "az mysql flexible-server show --name ${RESOURCE_PREFIX}-mysqlserver --resource-group $RG_NAME"; then
+              echo "MySQL Server: EXISTS in Azure"
+              import_resource "MySQL Server" "azurerm_mysql_flexible_server.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforMySQL/flexibleServers/${RESOURCE_PREFIX}-mysqlserver"
+            else
+              echo "MySQL Server: Does NOT exist"
+            fi
+
+            EFFECTIVE_DB_NAME="${DATABASE_NAME:-${RESOURCE_PREFIX}-db}"
+            echo ""
+            echo "=== Checking MySQL Database ==="
+            if resource_in_state "azurerm_mysql_flexible_server_database.main\[0\]"; then
+              echo "MySQL Database: Already in state - SKIP"
+            elif resource_exists_in_azure "az mysql flexible-server db show --database-name $EFFECTIVE_DB_NAME --server-name ${RESOURCE_PREFIX}-mysqlserver --resource-group $RG_NAME"; then
+              echo "MySQL Database: EXISTS in Azure"
+              import_resource "MySQL Database" "azurerm_mysql_flexible_server_database.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforMySQL/flexibleServers/${RESOURCE_PREFIX}-mysqlserver/databases/$EFFECTIVE_DB_NAME"
+            else
+              echo "MySQL Database: Does NOT exist"
+            fi
+
+            echo ""
+            echo "=== Checking MySQL Firewall Rule ==="
+            if resource_in_state "azurerm_mysql_flexible_server_firewall_rule.allow_azure\[0\]"; then
+              echo "MySQL Firewall Rule: Already in state - SKIP"
+            elif resource_exists_in_azure "az mysql flexible-server firewall-rule show --name AllowAzureServices --resource-group $RG_NAME --server-name ${RESOURCE_PREFIX}-mysqlserver"; then
+              echo "MySQL Firewall Rule: EXISTS in Azure"
+              import_resource "MySQL Firewall Rule" "azurerm_mysql_flexible_server_firewall_rule.allow_azure[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforMySQL/flexibleServers/${RESOURCE_PREFIX}-mysqlserver/firewallRules/AllowAzureServices"
+            else
+              echo "MySQL Firewall Rule: Does NOT exist"
+            fi
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Import process completed"
+          echo "=========================================="
+
+      - name: Terraform Plan
+        working-directory: ./infra/terraform/backend
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          RUNTIME_STACK="${{ needs.detect-and-setup.outputs.runtime_stack }}"
+          DATABASE_TYPE="${{ inputs.database_type }}"
+          DATABASE_NAME="${{ inputs.database_name }}"
+
+          TF_VARS="-var=app_name=$APP_NAME -var=project_type=backend -var=runtime_stack=$RUNTIME_STACK"
+
+          if [ "$DATABASE_TYPE" != "none" ] && [ -n "$DATABASE_TYPE" ]; then
+            TF_VARS="$TF_VARS -var=database_type=$DATABASE_TYPE"
+          fi
+          if [ -n "$DATABASE_NAME" ]; then
+            TF_VARS="$TF_VARS -var=database_name=$DATABASE_NAME"
+          fi
+          if [ -n "${{ secrets.SQL_ADMIN_PASSWORD }}" ] && [ "$DATABASE_TYPE" != "none" ]; then
+            TF_VARS="$TF_VARS -var=sql_admin_password=${{ secrets.SQL_ADMIN_PASSWORD }}"
+          fi
+
+          terraform plan $TF_VARS -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./infra/terraform/backend
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: terraform_output
+        working-directory: ./infra/terraform/backend
+        run: |
+          echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
+          echo "webapp_name=$(terraform output -raw webapp_name)" >> $GITHUB_OUTPUT
+
+          # Database outputs (may be empty if no database)
+          DB_SERVER=$(terraform output -raw db_server_fqdn 2>/dev/null || echo "")
+          DB_NAME=$(terraform output -raw db_name 2>/dev/null || echo "")
+          echo "db_server_fqdn=$DB_SERVER" >> $GITHUB_OUTPUT
+          echo "db_name=$DB_NAME" >> $GITHUB_OUTPUT
+
+          echo "Web App: $(terraform output -raw webapp_name)"
+          echo "DB Server: $DB_SERVER"
+          echo "DB Name: $DB_NAME"
+
+  # ============================================
+  # JOB 3: Build Backend (Multi-Technology)
+  # ============================================
+  build-backend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      # === .NET Build ===
+      - name: Fix global.json SDK version
+        if: needs.detect-and-setup.outputs.runtime_stack == 'dotnet'
+        run: |
+          if [ -f "global.json" ]; then
+            echo '{"sdk":{"version":"8.0.100","rollForward":"latestMajor"}}' > global.json
+            echo "Fixed global.json to allow SDK roll-forward"
+          fi
+
+      - name: Setup .NET
+        if: needs.detect-and-setup.outputs.runtime_stack == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: .NET Publish
+        if: needs.detect-and-setup.outputs.runtime_stack == 'dotnet'
+        run: dotnet publish ${{ needs.detect-and-setup.outputs.project_path }} --configuration Release --output ./publish
+
+      # === Node.js Build ===
+      - name: Setup Node.js
+        if: needs.detect-and-setup.outputs.runtime_stack == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Node.js Install and Build
+        if: needs.detect-and-setup.outputs.runtime_stack == 'node'
+        run: |
+          npm install
+          npm run build --if-present
+          mkdir -p ./publish
+          # Copy all files except .git and node_modules cache
+          rsync -a --exclude='.git' --exclude='node_modules/.cache' --exclude='publish' . ./publish/
+
+      # === Python Build ===
+      - name: Setup Python
+        if: needs.detect-and-setup.outputs.runtime_stack == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Python Install Dependencies
+        if: needs.detect-and-setup.outputs.runtime_stack == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+          mkdir -p ./publish
+          rsync -a --exclude='.git' --exclude='publish' . ./publish/
+
+      # === Java Build ===
+      - name: Setup Java
+        if: needs.detect-and-setup.outputs.runtime_stack == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Java Build (Maven)
+        if: needs.detect-and-setup.outputs.runtime_stack == 'java' && hashFiles('pom.xml') != ''
+        run: |
+          mvn clean package -DskipTests
+          mkdir -p ./publish
+          cp target/*.jar ./publish/ 2>/dev/null || cp target/*.war ./publish/ 2>/dev/null || true
+
+      - name: Java Build (Gradle)
+        if: needs.detect-and-setup.outputs.runtime_stack == 'java' && hashFiles('build.gradle') != ''
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          ./gradlew build -x test
+          mkdir -p ./publish
+          cp build/libs/*.jar ./publish/ 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp-artifact
+          path: ./publish
+
+  # ============================================
+  # JOB 4: Run Database Scripts (DB-First Approach)
+  # Scripts are in the COMPONENT repo under db-scripts/
+  # Code-First apps don't need this - app creates tables on startup
+  # ============================================
+  run-db-scripts:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+    if: inputs.database_type != 'none' && inputs.database_type != ''
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      - name: Run Database Scripts
+        env:
+          DB_SERVER: ${{ needs.terraform.outputs.db_server_fqdn }}
+          DB_NAME: ${{ needs.terraform.outputs.db_name }}
+          DB_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          DB_TYPE: ${{ inputs.database_type }}
+        run: |
+          # DB scripts are in the component repo (DB-First approach)
+          # Code-First apps won't have db-scripts/ folder - this job will skip gracefully
+          if [ ! -d "./db-scripts" ]; then
+            echo "No db-scripts/ directory found in component repo"
+            echo "This is expected for Code-First approach (app creates tables on startup)"
+            exit 0
+          fi
+
+          # Find SQL scripts (sorted for execution order: 001_xxx.sql, 002_yyy.sql, etc.)
+          SCRIPTS=$(find ./db-scripts -name "*.sql" -type f | sort)
+          if [ -z "$SCRIPTS" ]; then
+            echo "No SQL scripts found in db-scripts/ - skipping"
+            exit 0
+          fi
+
+          echo "DB-First Approach: Found SQL scripts to execute:"
+          echo "$SCRIPTS"
+          echo ""
+
+          # Install DB client and run scripts based on database type
+          case "$DB_TYPE" in
+            sqlserver)
+              echo "=== Installing SQL Server tools ==="
+              curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
+              curl -fsSL https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
+              sudo apt-get update
+              sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+
+              for script in $SCRIPTS; do
+                echo ""
+                echo "--- Running: $script ---"
+                sqlcmd -S "$DB_SERVER" -d "$DB_NAME" -U sqladmin -P "$DB_PASSWORD" -i "$script" -C
+                echo "Completed: $script"
+              done
+              ;;
+
+            postgresql)
+              echo "=== Installing PostgreSQL client ==="
+              sudo apt-get update && sudo apt-get install -y postgresql-client
+
+              for script in $SCRIPTS; do
+                echo ""
+                echo "--- Running: $script ---"
+                PGPASSWORD="$DB_PASSWORD" psql -h "$DB_SERVER" -p 5432 -U pgadmin -d "$DB_NAME" -f "$script"
+                echo "Completed: $script"
+              done
+              ;;
+
+            mysql)
+              echo "=== Installing MySQL client ==="
+              sudo apt-get update && sudo apt-get install -y mysql-client
+
+              for script in $SCRIPTS; do
+                echo ""
+                echo "--- Running: $script ---"
+                mysql -h "$DB_SERVER" -P 3306 -u mysqladmin -p"$DB_PASSWORD" "$DB_NAME" < "$script"
+                echo "Completed: $script"
+              done
+              ;;
+
+            *)
+              echo "Unknown database type: $DB_TYPE - skipping scripts"
+              ;;
+          esac
+
+          echo ""
+          echo "=========================================="
+          echo "All database scripts completed successfully"
+          echo "=========================================="
+
+  # ---- OLD JOB 5: run-code-migrations (REMOVED) ----
+  # Code-First Approach: App creates tables on startup via db.Database.Migrate()
+  # No need to run migrations in pipeline - Terraform creates server + DB,
+  # app handles schema creation when it starts.
+  # ---- END OLD ----
+
+  # ============================================
+  # JOB 5: Deploy Backend to Azure Web App
+  # ============================================
+  deploy-backend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-backend, run-db-scripts]
+    if: |
+      always() &&
+      needs.build-backend.result == 'success' &&
+      (needs.run-db-scripts.result == 'success' || needs.run-db-scripts.result == 'skipped')
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp-artifact
+          path: ./publish
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ needs.terraform.outputs.webapp_name }}
+          package: ./publish
+
+      - name: Set Backend Dependency App Settings
+        if: inputs.backend_dependency_urls != ''
+        run: |
+          echo "Setting backend dependency URLs as App Settings..."
+          echo "Input: ${{ inputs.backend_dependency_urls }}"
+
+          IFS=',' read -ra PAIRS <<< "${{ inputs.backend_dependency_urls }}"
+          SETTINGS=""
+          for pair in "${PAIRS[@]}"; do
+            SETTINGS="$SETTINGS $pair"
+          done
+
+          az webapp config appsettings set \
+            --name ${{ needs.terraform.outputs.webapp_name }} \
+            --resource-group ${{ needs.terraform.outputs.resource_group }} \
+            --settings $SETTINGS
+
+          echo "Backend dependency app settings configured successfully"
+          echo "Settings applied: $SETTINGS"
