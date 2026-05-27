@@ -390,6 +390,32 @@ jobs:
           echo "Import process completed"
           echo "=========================================="
 
+      - name: Handle OS Type Migration (Windows ↔ Linux)
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          RUNTIME_STACK="${{ needs.detect-and-setup.outputs.runtime_stack }}"
+          RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          RG_NAME="${RESOURCE_PREFIX}-rg"
+
+          EXISTING_KIND=$(az appservice plan show --name "${RESOURCE_PREFIX}-plan" --resource-group "$RG_NAME" --query "kind" -o tsv 2>/dev/null || echo "")
+          echo "Existing plan kind: '$EXISTING_KIND', Runtime: '$RUNTIME_STACK'"
+
+          NEEDS_LINUX=false
+          if [ "$RUNTIME_STACK" != "dotnet" ]; then
+            NEEDS_LINUX=true
+          fi
+
+          # Conflict: existing is Windows (app) but need Linux, or existing is Linux but need Windows
+          if ( [ "$NEEDS_LINUX" = "true" ] && [[ "$EXISTING_KIND" != *"linux"* ]] && [ -n "$EXISTING_KIND" ] ) || \
+             ( [ "$NEEDS_LINUX" = "false" ] && [[ "$EXISTING_KIND" == *"linux"* ]] ); then
+            echo "OS type mismatch detected — deleting web app and plan before recreation"
+            az webapp delete --name "${RESOURCE_PREFIX}-webapp" --resource-group "$RG_NAME" --yes 2>/dev/null || true
+            az appservice plan delete --name "${RESOURCE_PREFIX}-plan" --resource-group "$RG_NAME" --yes 2>/dev/null || true
+            echo "Deleted conflicting resources. Terraform will recreate them."
+          else
+            echo "No OS type conflict — skipping cleanup."
+          fi
+
       - name: Terraform Plan
         working-directory: ./infra/terraform/backend
         run: |
