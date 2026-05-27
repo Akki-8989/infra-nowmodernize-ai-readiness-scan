@@ -43,6 +43,12 @@ variable "backend_urls" {
   default     = ""
 }
 
+variable "tier" {
+  type        = string
+  description = "Deployment tier: free, standard, premium"
+  default     = "free"
+}
+
 # ============================================
 # LOCALS
 # ============================================
@@ -55,6 +61,7 @@ locals {
   )
   is_frontend    = var.project_type == "frontend"
   create_gateway = var.backend_urls != "" && local.is_frontend
+  gateway_sku    = var.tier == "premium" ? "S1" : var.tier == "standard" ? "B1" : "F1"
 }
 
 # ============================================
@@ -92,7 +99,7 @@ resource "azurerm_service_plan" "gateway" {
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
   os_type             = "Windows"
-  sku_name            = "F1"
+  sku_name            = local.gateway_sku
 
   depends_on = [azurerm_resource_group.main]
 }
