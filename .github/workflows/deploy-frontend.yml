@@ -1,0 +1,691 @@
+name: Reusable Deploy Workflow - Frontend (Generic)
+
+on:
+  workflow_call:
+    inputs:
+      repo_name:
+        required: true
+        type: string
+        description: 'Target repository name to deploy'
+      infra_repo:
+        required: true
+        type: string
+        description: 'Infrastructure repository name'
+      backend_api_url:
+        required: false
+        type: string
+        description: 'Backend API URL for frontend to connect to (single backend)'
+      backend_urls:
+        required: false
+        type: string
+        description: 'Comma-separated backend URLs (multiple backends - triggers gateway)'
+      route_map:
+        required: false
+        type: string
+        description: 'Path-to-backend routing overrides (format: api/admin/resources=be-content;api/status=be-system)'
+      tier:
+        required: false
+        type: string
+        default: 'free'
+        description: 'Deployment tier: free, standard, premium'
+
+env:
+  NODE_VERSION: '20.x'
+
+jobs:
+  # ============================================
+  # JOB 1: Detect Frontend Framework & Setup
+  # ============================================
+  detect-and-setup:
+    runs-on: ubuntu-latest
+    outputs:
+      project_type: ${{ steps.detect.outputs.project_type }}
+      build_command: ${{ steps.detect.outputs.build_command }}
+      output_path: ${{ steps.detect.outputs.output_path }}
+      api_url: ${{ steps.compute_api_url.outputs.url }}
+      needs_gateway: ${{ steps.compute_api_url.outputs.needs_gateway }}
+      app_name: ${{ steps.setup.outputs.app_name }}
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      - name: Detect Frontend Framework
+        id: detect
+        run: |
+          echo "project_type=frontend" >> $GITHUB_OUTPUT
+
+          if [ -f "package.json" ]; then
+            if grep -q '"next"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=out" >> $GITHUB_OUTPUT
+              echo "Detected: Next.js"
+            elif grep -q '"vite"\|"@vitejs"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+              echo "Detected: Vite"
+            elif grep -q '"react-scripts"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=build" >> $GITHUB_OUTPUT
+              echo "Detected: Create React App"
+            elif grep -q '"@angular/core"' package.json; then
+              echo "build_command=npm run build -- --configuration production" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+              echo "Detected: Angular"
+            elif grep -q '"vue"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+              echo "Detected: Vue.js"
+            else
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+              echo "Detected: Generic Node.js frontend"
+            fi
+          fi
+
+      - name: Compute API URL
+        id: compute_api_url
+        run: |
+          if [ -n "${{ inputs.backend_urls }}" ]; then
+            SLUG=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+            echo "url=https://${SLUG}-gateway-webapp.azurewebsites.net" >> $GITHUB_OUTPUT
+            echo "needs_gateway=true" >> $GITHUB_OUTPUT
+          elif [ -n "${{ inputs.backend_api_url }}" ]; then
+            echo "url=${{ inputs.backend_api_url }}" >> $GITHUB_OUTPUT
+            echo "needs_gateway=false" >> $GITHUB_OUTPUT
+          else
+            echo "url=" >> $GITHUB_OUTPUT
+            echo "needs_gateway=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup App Name
+        id: setup
+        run: |
+          APP_NAME=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "App name: $APP_NAME"
+
+  # ============================================
+  # JOB 2: Terraform (Infrastructure)
+  # ============================================
+  terraform:
+    runs-on: ubuntu-latest
+    needs: detect-and-setup
+    outputs:
+      static_webapp_name: ${{ steps.terraform_output.outputs.static_webapp_name }}
+      deployment_token: ${{ steps.terraform_output.outputs.deployment_token }}
+      resource_group: ${{ steps.terraform_output.outputs.resource_group }}
+      gateway_webapp_name: ${{ steps.terraform_output.outputs.gateway_webapp_name }}
+
+    steps:
+      - name: Checkout Infrastructure Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.infra_repo }}
+          path: infra
+
+      - name: Debug - List contents
+        run: |
+          echo "=== Infrastructure Repo ==="
+          echo "${{ github.repository_owner }}/${{ inputs.infra_repo }}"
+          echo ""
+          echo "=== List infra/terraform folder ==="
+          ls -la ./infra/terraform/
+          echo ""
+          echo "=== List frontend folder ==="
+          ls -la ./infra/terraform/frontend/
+          echo ""
+          echo "=== Needs Gateway: ${{ needs.detect-and-setup.outputs.needs_gateway }} ==="
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./infra/terraform/frontend
+        run: terraform init
+
+      - name: Import Existing Resources
+        working-directory: ./infra/terraform/frontend
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
+          SUBSCRIPTION_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+          RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          BACKEND_API_URL="${{ inputs.backend_api_url }}"
+          BACKEND_URLS="${{ inputs.backend_urls }}"
+
+          echo "=========================================="
+          echo "App Name: $APP_NAME"
+          echo "Resource Prefix: $RESOURCE_PREFIX"
+          echo "Backend API URL: $BACKEND_API_URL"
+          echo "Backend URLs: $BACKEND_URLS"
+          echo "=========================================="
+
+          TIER="${{ inputs.tier }}"
+          [ -z "$TIER" ] && TIER="free"
+
+          build_import_vars() {
+            local VARS="-var=app_name=$APP_NAME -var=project_type=frontend -var=tier=$TIER"
+            if [ -n "$BACKEND_API_URL" ]; then
+              VARS="$VARS -var=backend_api_url=$BACKEND_API_URL"
+            fi
+            if [ -n "$BACKEND_URLS" ]; then
+              VARS="$VARS -var=backend_urls=$BACKEND_URLS"
+            fi
+            echo "$VARS"
+          }
+
+          resource_exists_in_azure() {
+            local CHECK_COMMAND=$1
+            if eval "$CHECK_COMMAND" > /dev/null 2>&1; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          resource_in_state() {
+            local RESOURCE_ADDRESS=$1
+            if terraform state list 2>/dev/null | grep -q "$RESOURCE_ADDRESS"; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          import_resource() {
+            local RESOURCE_TYPE=$1
+            local RESOURCE_ADDRESS=$2
+            local RESOURCE_ID=$3
+            local IMPORT_VARS=$(build_import_vars)
+
+            echo ""
+            echo "--- Importing $RESOURCE_TYPE ---"
+            terraform import $IMPORT_VARS "$RESOURCE_ADDRESS" "$RESOURCE_ID" 2>&1 && echo "$RESOURCE_TYPE: Import SUCCESS" || echo "$RESOURCE_TYPE: Import FAILED"
+          }
+
+          echo ""
+          echo "=== Checking Resource Group ==="
+          if resource_in_state "azurerm_resource_group.main"; then
+            echo "Resource Group: Already in state - SKIP"
+          elif resource_exists_in_azure "az group exists --name $RG_NAME | grep -q true"; then
+            echo "Resource Group: EXISTS in Azure"
+            import_resource "Resource Group" "azurerm_resource_group.main" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME"
+          else
+            echo "Resource Group: Does NOT exist - will be created"
+          fi
+
+          echo ""
+          echo "=== Checking Static Web App ==="
+          if resource_in_state "azurerm_static_web_app.main\[0\]"; then
+            echo "Static Web App: Already in state - SKIP"
+          elif resource_exists_in_azure "az staticwebapp show --name ${RESOURCE_PREFIX}-static --resource-group $RG_NAME"; then
+            echo "Static Web App: EXISTS in Azure"
+            import_resource "Static Web App" "azurerm_static_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/staticSites/${RESOURCE_PREFIX}-static"
+          else
+            echo "Static Web App: Does NOT exist - will be created"
+          fi
+
+          if [ -n "$BACKEND_URLS" ]; then
+            echo ""
+            echo "=== Checking Gateway App Service Plan ==="
+            if resource_in_state "azurerm_service_plan.gateway\[0\]"; then
+              echo "Gateway Plan: Already in state - SKIP"
+            elif resource_exists_in_azure "az appservice plan show --name ${RESOURCE_PREFIX}-gateway-plan --resource-group $RG_NAME"; then
+              echo "Gateway Plan: EXISTS in Azure"
+              import_resource "Gateway Plan" "azurerm_service_plan.gateway[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/serverFarms/${RESOURCE_PREFIX}-gateway-plan"
+            else
+              echo "Gateway Plan: Does NOT exist - will be created"
+            fi
+
+            echo ""
+            echo "=== Checking Gateway Web App ==="
+            if resource_in_state "azurerm_windows_web_app.gateway\[0\]"; then
+              echo "Gateway Web App: Already in state - SKIP"
+            elif resource_exists_in_azure "az webapp show --name ${RESOURCE_PREFIX}-gateway-webapp --resource-group $RG_NAME"; then
+              echo "Gateway Web App: EXISTS in Azure"
+              import_resource "Gateway Web App" "azurerm_windows_web_app.gateway[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-gateway-webapp"
+            else
+              echo "Gateway Web App: Does NOT exist - will be created"
+            fi
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Import process completed"
+          echo "=========================================="
+
+      - name: Terraform Plan
+        working-directory: ./infra/terraform/frontend
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          TIER="${{ inputs.tier }}"
+          [ -z "$TIER" ] && TIER="free"
+          TF_VARS="-var=app_name=$APP_NAME -var=project_type=frontend -var=tier=$TIER"
+
+          if [ -n "${{ inputs.backend_api_url }}" ]; then
+            TF_VARS="$TF_VARS -var=backend_api_url=${{ inputs.backend_api_url }}"
+          fi
+          if [ -n "${{ inputs.backend_urls }}" ]; then
+            TF_VARS="$TF_VARS -var=backend_urls=${{ inputs.backend_urls }}"
+          fi
+
+          terraform plan $TF_VARS -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./infra/terraform/frontend
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: terraform_output
+        working-directory: ./infra/terraform/frontend
+        run: |
+          echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
+          echo "static_webapp_name=$(terraform output -raw static_webapp_name)" >> $GITHUB_OUTPUT
+          echo "deployment_token=$(terraform output -raw static_webapp_api_key)" >> $GITHUB_OUTPUT
+
+          GATEWAY_NAME=$(terraform output -raw gateway_webapp_name 2>/dev/null || echo "")
+          if [ -n "$GATEWAY_NAME" ]; then
+            echo "gateway_webapp_name=$GATEWAY_NAME" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Static Web App: $(terraform output -raw static_webapp_name)"
+          echo "Gateway: $GATEWAY_NAME"
+
+  # ============================================
+  # JOB 3: Build Frontend
+  # ============================================
+  build-frontend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm ci 2>/dev/null || npm install
+
+      - name: Auto-fix API URLs for gateway
+        if: needs.detect-and-setup.outputs.needs_gateway == 'true' || needs.detect-and-setup.outputs.api_url != ''
+        shell: bash
+        env:
+          API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+          FIX_SCRIPT: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Detect framework from package.json
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+
+            let envVarCode;
+            if (deps['vite'] || deps['@vitejs/plugin-react'] || deps['@vitejs/plugin-vue']) {
+              envVarCode = 'import.meta.env.VITE_API_URL';
+            } else if (deps['react-scripts']) {
+              envVarCode = 'process.env.REACT_APP_API_URL';
+            } else if (deps['next']) {
+              envVarCode = 'process.env.NEXT_PUBLIC_API_URL';
+            } else if (deps['@vue/cli-service']) {
+              envVarCode = 'process.env.VUE_APP_API_URL';
+            } else {
+              envVarCode = 'import.meta.env.VITE_API_URL';
+            }
+
+            // Determine TypeScript or JavaScript
+            const isTS = fs.existsSync('tsconfig.json');
+            const ext = isTS ? 'ts' : 'js';
+            const srcDir = fs.existsSync('src') ? 'src' : '.';
+
+            // Create api-config helper file
+            const configDir = path.join(srcDir, 'lib');
+            if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+            const configPath = path.join(configDir, `api-config.${ext}`);
+            if (!fs.existsSync(configPath)) {
+              fs.writeFileSync(configPath, `export const API_BASE_URL = ${envVarCode} || "";\n`);
+              console.log('Created: ' + configPath);
+            }
+
+            // Find source files recursively
+            function findFiles(dir, exts) {
+              let results = [];
+              try {
+                for (const item of fs.readdirSync(dir)) {
+                  if (['node_modules', '.git', 'dist', 'build', '.next', 'out'].includes(item)) continue;
+                  const full = path.join(dir, item);
+                  const stat = fs.statSync(full);
+                  if (stat.isDirectory()) results = results.concat(findFiles(full, exts));
+                  else if (exts.some(e => full.endsWith(e))) results.push(full);
+                }
+              } catch {}
+              return results;
+            }
+
+            const files = findFiles(srcDir, ['.ts', '.tsx', '.js', '.jsx', '.vue']);
+            let totalFixed = 0;
+
+            for (const file of files) {
+              if (file === configPath) continue;
+              let content = fs.readFileSync(file, 'utf8');
+
+              // Skip if no relative /api/ fetch calls
+              if (!content.includes("fetch('/api/") && !content.includes('fetch("/api/') && !content.includes("fetch(`/api/")) continue;
+
+              // Skip if already using API_BASE_URL
+              if (content.includes('API_BASE_URL')) continue;
+
+              // Calculate relative import path
+              const configModule = configPath.replace(/\.[^.]+$/, '');
+              let importPath = path.relative(path.dirname(file), configModule).replace(/\\/g, '/');
+              if (!importPath.startsWith('.')) importPath = './' + importPath;
+
+              // Add import after last import statement
+              const importLine = "import { API_BASE_URL } from '" + importPath + "';";
+              const lines = content.split('\n');
+              let lastImportIndex = -1;
+              for (let i = 0; i < lines.length; i++) {
+                if (lines[i].startsWith('import ') || lines[i].startsWith('import{')) lastImportIndex = i;
+              }
+              if (lastImportIndex >= 0) lines.splice(lastImportIndex + 1, 0, importLine);
+              else lines.unshift(importLine);
+              content = lines.join('\n');
+
+              // Replace relative /api/ paths with API_BASE_URL prefix
+              content = content.replace(/fetch\('\/api\/([^']+)'/g, 'fetch(`${API_BASE_URL}/api/$1`');
+              content = content.replace(/fetch\("\/api\/([^"]+)"/g, 'fetch(`${API_BASE_URL}/api/$1`');
+              content = content.replace(/fetch\(`\/api\//g, 'fetch(`${API_BASE_URL}/api/');
+
+              fs.writeFileSync(file, content, 'utf8');
+              console.log('Fixed: ' + file);
+              totalFixed++;
+            }
+
+            console.log('\nTotal files fixed: ' + totalFixed);
+            if (totalFixed === 0) console.log('No files needed fixing (already configured or no /api/ calls found)');
+        run: |
+          echo "$FIX_SCRIPT" > /tmp/fix-api-urls.js
+          node /tmp/fix-api-urls.js
+
+      - name: Build
+        run: ${{ needs.detect-and-setup.outputs.build_command }}
+        env:
+          CI: false
+          VITE_API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+          REACT_APP_API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+          NEXT_PUBLIC_API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+          VUE_APP_API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-artifact
+          path: ${{ needs.detect-and-setup.outputs.output_path }}
+
+  # ============================================
+  # JOB 4: Build Gateway (Smart API Router)
+  # Convention-based routing with fallback
+  # Routes: be-auth -> /api/auth/*, be-content -> /api/content/*, etc.
+  # ============================================
+  build-gateway:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+    if: needs.detect-and-setup.outputs.needs_gateway == 'true'
+
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Generate API Gateway
+        shell: bash
+        env:
+          GATEWAY_CODE: |
+            using System.Net;
+            using System.Net.Http.Headers;
+
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("proxy").ConfigurePrimaryHttpMessageHandler(() =>
+                new HttpClientHandler { AllowAutoRedirect = false });
+            builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
+                p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+
+            var app = builder.Build();
+            app.UseCors();
+
+            // Read configuration
+            var backendUrls = app.Configuration["BACKEND_URLS"]
+                ?? Environment.GetEnvironmentVariable("BACKEND_URLS") ?? "";
+            var routeMapStr = app.Configuration["ROUTE_MAP"]
+                ?? Environment.GetEnvironmentVariable("ROUTE_MAP") ?? "";
+            var backends = backendUrls.Split(',',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            // Build routing table: (pathPrefix, backendUrl, backendName)
+            var routeTable = new List<(string Prefix, string BackendUrl, string Name)>();
+
+            // 1. Parse ROUTE_MAP overrides (highest priority)
+            // Format: "api/admin/resources=be-content;api/status=be-system"
+            if (!string.IsNullOrEmpty(routeMapStr))
+            {
+                foreach (var mapping in routeMapStr.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var parts = mapping.Split('=', 2);
+                    if (parts.Length == 2)
+                    {
+                        var pathPrefix = "/" + parts[0].Trim().TrimStart('/');
+                        if (!pathPrefix.EndsWith("/")) pathPrefix += "/";
+                        var backendName = parts[1].Trim();
+                        var backendUrl = backends.FirstOrDefault(u =>
+                        {
+                            var host = new Uri(u).Host.Split('.')[0].Replace("-webapp", "");
+                            return host.Equals(backendName, StringComparison.OrdinalIgnoreCase);
+                        });
+                        if (backendUrl != null)
+                            routeTable.Add((pathPrefix, backendUrl, backendName));
+                    }
+                }
+            }
+
+            // 2. Convention routes: be-X -> /api/X/ and /api/admin/X/
+            foreach (var url in backends)
+            {
+                var host = new Uri(url).Host.Split('.')[0].Replace("-webapp", "");
+                var svc = host.StartsWith("be-") ? host.Substring(3) : host;
+                routeTable.Add(($"/api/{svc}/", url, host));
+                routeTable.Add(($"/api/admin/{svc}/", url, host));
+            }
+
+            // Health endpoint - shows all configured routes
+            app.MapGet("/health", () => Results.Ok(new
+            {
+                status = "healthy",
+                backends = backends.Length,
+                routes = routeTable.Select(r => new { prefix = r.Prefix, backend = r.Name })
+            }));
+
+            // Main proxy handler
+            app.Map("/{**path}", async (HttpContext ctx, IHttpClientFactory factory) =>
+            {
+                var requestPath = ctx.Request.Path.Value ?? "";
+                var client = factory.CreateClient("proxy");
+
+                // Step 1: Try route table match (ROUTE_MAP overrides checked first, then convention)
+                foreach (var (prefix, backendUrl, name) in routeTable)
+                {
+                    var trimmedPrefix = prefix.TrimEnd('/');
+                    if (requestPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+                        requestPath.Equals(trimmedPrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var response = await ForwardAsync(ctx, client, backendUrl);
+                        if (response != null)
+                        {
+                            await WriteResponseAsync(ctx, response);
+                            return;
+                        }
+                    }
+                }
+
+                // Step 2: Fallback - try each backend for unmatched routes
+                foreach (var url in backends)
+                {
+                    var response = await ForwardAsync(ctx, client, url);
+                    if (response != null && response.StatusCode != HttpStatusCode.NotFound)
+                    {
+                        await WriteResponseAsync(ctx, response);
+                        return;
+                    }
+                    response?.Dispose();
+                }
+
+                ctx.Response.StatusCode = 404;
+                await ctx.Response.WriteAsJsonAsync(new { error = "Not found", path = requestPath });
+            });
+
+            // Forward HTTP request to a backend
+            static async Task<HttpResponseMessage?> ForwardAsync(
+                HttpContext ctx, HttpClient client, string backendUrl)
+            {
+                try
+                {
+                    var targetUrl = $"{backendUrl.TrimEnd('/')}{ctx.Request.Path}{ctx.Request.QueryString}";
+                    var request = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), targetUrl);
+
+                    // Copy request headers (skip Host)
+                    foreach (var header in ctx.Request.Headers)
+                    {
+                        if (!header.Key.StartsWith("Host", StringComparison.OrdinalIgnoreCase))
+                            request.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
+                    }
+
+                    // Copy request body for POST/PUT/PATCH
+                    if (ctx.Request.ContentLength > 0 || ctx.Request.ContentType != null)
+                    {
+                        ctx.Request.EnableBuffering();
+                        ctx.Request.Body.Position = 0;
+                        var body = new MemoryStream();
+                        await ctx.Request.Body.CopyToAsync(body);
+                        body.Position = 0;
+                        ctx.Request.Body.Position = 0;
+                        request.Content = new StreamContent(body);
+                        if (ctx.Request.ContentType != null)
+                            request.Content.Headers.ContentType =
+                                MediaTypeHeaderValue.Parse(ctx.Request.ContentType);
+                    }
+
+                    return await client.SendAsync(request);
+                }
+                catch { return null; }
+            }
+
+            // Write backend response back to client
+            static async Task WriteResponseAsync(HttpContext ctx, HttpResponseMessage response)
+            {
+                ctx.Response.StatusCode = (int)response.StatusCode;
+                foreach (var header in response.Headers.Concat(response.Content.Headers))
+                {
+                    if (!header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+                        ctx.Response.Headers[header.Key] = header.Value.ToArray();
+                }
+                await response.Content.CopyToAsync(ctx.Response.Body);
+            }
+
+            app.Run();
+        run: |
+          dotnet new web -n GatewayApp --no-https
+          cd GatewayApp
+          echo "$GATEWAY_CODE" > Program.cs
+          echo "Gateway Program.cs generated"
+          cat Program.cs
+
+      - name: Build Gateway
+        run: cd GatewayApp && dotnet publish --configuration Release --output ./publish
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-artifact
+          path: ./GatewayApp/publish
+
+  # ============================================
+  # JOB 5: Deploy Frontend to Azure Static Web App
+  # ============================================
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-frontend]
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-artifact
+          path: ./dist
+
+      - name: Deploy to Azure Static Web App
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ needs.terraform.outputs.deployment_token }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: "upload"
+          app_location: "./dist"
+          skip_app_build: true
+
+  # ============================================
+  # JOB 6: Deploy Gateway (only when multiple backends)
+  # ============================================
+  deploy-gateway:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-gateway]
+    if: needs.detect-and-setup.outputs.needs_gateway == 'true'
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gateway-artifact
+          path: ./gateway-publish
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Configure Gateway Route Map
+        if: inputs.route_map != ''
+        run: |
+          az webapp config appsettings set \
+            --name ${{ needs.terraform.outputs.gateway_webapp_name }} \
+            --resource-group ${{ needs.terraform.outputs.resource_group }} \
+            --settings ROUTE_MAP="${{ inputs.route_map }}"
+
+      - name: Deploy Gateway to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ needs.terraform.outputs.gateway_webapp_name }}
+          package: ./gateway-publish
