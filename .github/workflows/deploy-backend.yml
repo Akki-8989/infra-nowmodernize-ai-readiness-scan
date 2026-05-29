@@ -105,7 +105,6 @@ jobs:
     needs: detect-and-setup
     outputs:
       webapp_name: ${{ steps.terraform_output.outputs.webapp_name }}
-      webapp_url: ${{ steps.terraform_output.outputs.webapp_url }}
       resource_group: ${{ steps.terraform_output.outputs.resource_group }}
       db_server_fqdn: ${{ steps.terraform_output.outputs.db_server_fqdn }}
       db_name: ${{ steps.terraform_output.outputs.db_name }}
@@ -450,7 +449,6 @@ jobs:
         run: |
           echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
           echo "webapp_name=$(terraform output -raw webapp_name)" >> $GITHUB_OUTPUT
-          echo "webapp_url=$(terraform output -raw webapp_url)" >> $GITHUB_OUTPUT
 
           # Database outputs (may be empty if no database)
           DB_SERVER=$(terraform output -raw db_server_fqdn 2>/dev/null || echo "")
@@ -459,7 +457,6 @@ jobs:
           echo "db_name=$DB_NAME" >> $GITHUB_OUTPUT
 
           echo "Web App: $(terraform output -raw webapp_name)"
-          echo "Web App URL: $(terraform output -raw webapp_url)"
           echo "DB Server: $DB_SERVER"
           echo "DB Name: $DB_NAME"
 
@@ -685,19 +682,6 @@ jobs:
         with:
           app-name: ${{ needs.terraform.outputs.webapp_name }}
           package: ./publish
-
-      - name: Notify Deployed URL
-        run: |
-          WEBAPP_URL="${{ needs.terraform.outputs.webapp_url }}"
-          CALLBACK_URL="${{ secrets.DEPLOYMENT_CALLBACK_URL }}"
-          if [ -z "$WEBAPP_URL" ] || [ -z "$CALLBACK_URL" ]; then
-            echo "Skipping URL callback (no webapp_url or no DEPLOYMENT_CALLBACK_URL secret)"
-            exit 0
-          fi
-          curl -s -X POST "$CALLBACK_URL/api/v2/deployment/url-callback" \
-            -H "Content-Type: application/json" \
-            -d "{\"repoName\":\"${{ inputs.repo_name }}\",\"webappUrl\":\"$WEBAPP_URL\",\"webappType\":\"backend\"}"
-          echo "URL callback sent: $WEBAPP_URL"
 
       - name: Set Backend Dependency App Settings
         if: inputs.backend_dependency_urls != ''
