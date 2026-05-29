@@ -113,6 +113,7 @@ jobs:
     needs: detect-and-setup
     outputs:
       static_webapp_name: ${{ steps.terraform_output.outputs.static_webapp_name }}
+      static_webapp_url: ${{ steps.terraform_output.outputs.static_webapp_url }}
       deployment_token: ${{ steps.terraform_output.outputs.deployment_token }}
       resource_group: ${{ steps.terraform_output.outputs.resource_group }}
       gateway_webapp_name: ${{ steps.terraform_output.outputs.gateway_webapp_name }}
@@ -295,6 +296,7 @@ jobs:
         run: |
           echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
           echo "static_webapp_name=$(terraform output -raw static_webapp_name)" >> $GITHUB_OUTPUT
+          echo "static_webapp_url=$(terraform output -raw static_webapp_url)" >> $GITHUB_OUTPUT
           echo "deployment_token=$(terraform output -raw static_webapp_api_key)" >> $GITHUB_OUTPUT
 
           GATEWAY_NAME=$(terraform output -raw gateway_webapp_name 2>/dev/null || echo "")
@@ -303,6 +305,7 @@ jobs:
           fi
 
           echo "Static Web App: $(terraform output -raw static_webapp_name)"
+          echo "Static Web App URL: $(terraform output -raw static_webapp_url)"
           echo "Gateway: $GATEWAY_NAME"
 
   # ============================================
@@ -649,6 +652,19 @@ jobs:
           action: "upload"
           app_location: "./dist"
           skip_app_build: true
+
+      - name: Notify Deployed URL
+        run: |
+          STATIC_URL="${{ needs.terraform.outputs.static_webapp_url }}"
+          CALLBACK_URL="${{ secrets.DEPLOYMENT_CALLBACK_URL }}"
+          if [ -z "$STATIC_URL" ] || [ -z "$CALLBACK_URL" ]; then
+            echo "Skipping URL callback (no static_webapp_url or no DEPLOYMENT_CALLBACK_URL secret)"
+            exit 0
+          fi
+          curl -s -X POST "$CALLBACK_URL/api/v2/deployment/url-callback" \
+            -H "Content-Type: application/json" \
+            -d "{\"repoName\":\"${{ inputs.repo_name }}\",\"webappUrl\":\"$STATIC_URL\",\"webappType\":\"frontend\"}"
+          echo "URL callback sent: $STATIC_URL"
 
   # ============================================
   # JOB 6: Deploy Gateway (only when multiple backends)
